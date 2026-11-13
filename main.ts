@@ -8,11 +8,16 @@
 //     to its share, (1 - S) * x / S, ramped linearly to full strength at h=240.
 //     (Proportional, not equal, drift: big markets absorb most of the correction.)
 //   - Per-market spread from recent realised volatility: sigma_m =
-//     clamp(0.0002 + 0.45 * RMS120, 0.00015, 0.002), where RMS120 is the root
-//     mean square of the last <=120 one-minute diffs, each winsorised at 0.01.
+//     clamp(0.0002 + 0.45 * RMS120, 0.00015, 0.0025), where RMS120 is the root
+//     mean square of the last <=120 one-minute diffs, each winsorised at 0.02.
 //     Prices are mostly flat with rare large jumps, so a market that just moved
 //     gets a much wider interval than a dead one; the floor keeps quiet markets
-//     from collapsing to a point forecast.
+//     from collapsing to a point forecast. Revision (2026-11-13): the old cap
+//     0.002 bound on 9/128 practice market-cases and the uncapped sigma reached
+//     0.0032, so the cap was truncating genuinely volatile markets; the 0.01
+//     winsorisation likewise cut real jump signal. Raising the cap to 0.0025
+//     and the winsorisation to 0.02 improved the pooled practice pinball from
+//     0.3003 to 0.2981 (see analysis/results.md).
 //   - Fat-tailed quantile multipliers, not normal z: [-3.5, -0.75, 0, 0.75, 3.5]
 //     times sigma_m * sqrt(h). The outer levels are far wider than a normal
 //     (jump risk), the inner levels narrower than the baseline's (most minutes
@@ -53,12 +58,12 @@ const Z = [-3.5, -0.75, 0, 0.75, 3.5];
 /** Recent-volatility window, in minutes, for the per-market sigma. */
 const VOL_WINDOW = 120;
 /** Winsorisation cap for one-minute diffs when estimating volatility. */
-const DIFF_CAP = 0.01;
+const DIFF_CAP = 0.02;
 /** Per-market sigma = clamp(SIGMA_FLOOR_A + SIGMA_B * RMS120, SIGMA_MIN, SIGMA_MAX). */
 const SIGMA_A = 0.0002;
 const SIGMA_B = 0.45;
 const SIGMA_MIN = 0.00015;
-const SIGMA_MAX = 0.002;
+const SIGMA_MAX = 0.0025;
 
 interface CaseMarket {
   id: string;
@@ -113,11 +118,17 @@ for (const file of inputs) {
   const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
   if (c.quantiles.length !== QUANTILES.length || c.quantiles.some((t, j) => t !== QUANTILES[j])) throw new Error(`${file} asks for quantiles ${JSON.stringify(c.quantiles)}, not ${JSON.stringify(QUANTILES)}`);
   // Cross-market sum at the checkpoint; each market's drift is proportional
-  // to its share of that sum. Guarded: a non-positive sum means no drift.
+  // to its share of that sum. Guarded: the drift divides by the sum, so a sum
+  // far from 1 (a partial or broken universe, e.g. S = 0.05 would give a drift
+  // of 19x the price) must not be corrected at all — only a sum in
+  // [0.25, 2] is treated as a small mis-pricing to drift back toward 1.
+  // Practice sums are 0.81-1.09, so this guard never fires there; it exists
+  // for unseen final cases.
   const sumLast = c.markets.reduce((s, m) => s + (m.prices.length === 0 ? 0 : (m.prices[m.prices.length - 1] as number)), 0);
+  const sumSane = sumLast >= 0.25 && sumLast <= 2;
   const forecasts = c.markets.map((m) => {
     const x = m.prices.length === 0 ? 0 : (m.prices[m.prices.length - 1] as number);
-    const drift = sumLast > 0 ? ((1 - sumLast) * x) / sumLast : 0;
+    const drift = sumSane ? ((1 - sumLast) * x) / sumLast : 0;
     return { id: m.id, q: forecast(m, c.horizon_minutes, drift) };
   });
   writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ forecasts })}\n`);
